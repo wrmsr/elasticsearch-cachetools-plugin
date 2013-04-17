@@ -7,6 +7,7 @@ import org.elasticsearch.client.internal.InternalGenericClient;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.inject.Module;
 import org.elasticsearch.common.lucene.docset.DocSet;
+import org.elasticsearch.common.lucene.docset.FixedBitDocSet;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.index.cache.filter.weighted.WeightedFilterCache;
@@ -17,6 +18,7 @@ import org.elasticsearch.threadpool.ThreadPool;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
@@ -65,17 +67,17 @@ public class GetCacheContents {
 
     public static class GetCacheContentsResponse extends ActionResponse {
 
-        private ArrayList<String> cacheEntries;
+        private ArrayList<Map<String, String>> cacheEntries;
 
         public GetCacheContentsResponse() {
-            cacheEntries = new ArrayList<String>();
+            cacheEntries = new ArrayList<Map<String, String>>();
         }
 
-        public void addCacheEntry(String cacheEntry) {
+        public void addCacheEntry(Map<String, String> cacheEntry) {
             cacheEntries.add(cacheEntry);
         }
 
-        public List<String> getCacheEntries() {
+        public List<Map<String, String>> getCacheEntries() {
             return cacheEntries;
         }
     }
@@ -114,8 +116,20 @@ public class GetCacheContents {
                     indicesFilterCache.cache().asMap();
             for (Map.Entry<WeightedFilterCache.FilterCacheKey, DocSet> cacheEntry : filterCacheMap.entrySet()) {
                 WeightedFilterCache.FilterCacheKey cacheKey = cacheEntry.getKey();
-                response.addCacheEntry(
-                        String.format("%s :: %s", cacheKey.readerKey().toString(), cacheKey.filterKey().toString()));
+                Map<String, String> responseEntry = new HashMap<String, String>();
+
+                responseEntry.put("reader_key", cacheKey.readerKey().toString());
+                responseEntry.put("filter_key", cacheKey.filterKey().toString());
+                DocSet docSet = cacheEntry.getValue();
+                responseEntry.put("length", String.valueOf(docSet.length()));
+                responseEntry.put("size_in_bytes", String.valueOf(docSet.sizeInBytes()));
+                responseEntry.put("doc_set_class", docSet.getClass().getName());
+                if (docSet instanceof FixedBitDocSet) {
+                    FixedBitDocSet bitDocSet = (FixedBitDocSet) cacheEntry.getValue();
+                    responseEntry.put("cardinality", String.valueOf(bitDocSet.set().cardinality()));
+                }
+
+                response.addCacheEntry(responseEntry);
             }
             listener.onResponse(response);
         }
@@ -165,8 +179,12 @@ public class GetCacheContents {
 
                         builder.field("cache_entries");
                         builder.startArray();
-                        for (String cacheEntry : response.getCacheEntries())
-                            builder.value(cacheEntry);
+                        for (Map<String, String> cacheEntry : response.getCacheEntries()) {
+                            builder.startObject();
+                            for (Map.Entry<String, String> entry : cacheEntry.entrySet())
+                                builder.field(entry.getKey(), entry.getValue());
+                            builder.endObject();
+                        }
                         builder.endArray();
 
                         builder.endObject();
