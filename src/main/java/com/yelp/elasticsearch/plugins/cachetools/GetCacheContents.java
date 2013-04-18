@@ -4,19 +4,26 @@ import org.elasticsearch.action.*;
 import org.elasticsearch.action.support.TransportAction;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.client.internal.InternalGenericClient;
+import org.elasticsearch.common.cache.Cache;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.inject.Module;
 import org.elasticsearch.common.lucene.docset.DocSet;
 import org.elasticsearch.common.lucene.docset.FixedBitDocSet;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.index.cache.field.data.FieldDataCache;
+import org.elasticsearch.index.cache.field.data.support.AbstractConcurrentMapFieldDataCache;
 import org.elasticsearch.index.cache.filter.weighted.WeightedFilterCache;
+import org.elasticsearch.index.field.data.FieldData;
+import org.elasticsearch.index.service.IndexService;
+import org.elasticsearch.indices.IndicesService;
 import org.elasticsearch.indices.cache.filter.IndicesFilterCache;
 import org.elasticsearch.rest.*;
 import org.elasticsearch.rest.action.support.RestXContentBuilder;
 import org.elasticsearch.threadpool.ThreadPool;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -67,18 +74,18 @@ public class GetCacheContents {
 
     public static class GetCacheContentsResponse extends ActionResponse {
 
-        private ArrayList<Map<String, String>> cacheEntries;
+        private Map<String, List<Map<String, String>>> cacheContentsMap;
 
         public GetCacheContentsResponse() {
-            cacheEntries = new ArrayList<Map<String, String>>();
+            cacheContentsMap = new HashMap<String, List<Map<String, String>>>();
         }
 
-        public void addCacheEntry(Map<String, String> cacheEntry) {
-            cacheEntries.add(cacheEntry);
+        public void addCacheContentsEntry(String name, List<Map<String, String>> cacheContents) {
+            cacheContentsMap.put(name, cacheContents);
         }
 
-        public List<Map<String, String>> getCacheEntries() {
-            return cacheEntries;
+        public Map<String, List<Map<String, String>>> getContentsMap() {
+            return cacheContentsMap;
         }
     }
 
@@ -102,36 +109,85 @@ public class GetCacheContents {
             TransportAction<GetCacheContentsRequest, GetCacheContentsResponse> {
 
         private IndicesFilterCache indicesFilterCache;
+        private IndicesService indicesService;
 
         @Inject
         public TransportGetCacheContentsAction(Settings settings, ThreadPool threadPool,
-                                               IndicesFilterCache indicesFilterCache) {
+                                               IndicesFilterCache indicesFilterCache,
+                                               IndicesService indicesService) {
             super(settings, threadPool);
             this.indicesFilterCache = indicesFilterCache;
+            this.indicesService = indicesService;
         }
 
         protected void doExecute(GetCacheContentsRequest request, ActionListener<GetCacheContentsResponse> listener) {
             GetCacheContentsResponse response = new GetCacheContentsResponse();
+            response.addCacheContentsEntry("filter_cache", getFilterCacheContents());
+            response.addCacheContentsEntry("field_cache", getFieldCacheContents());
+            listener.onResponse(response);
+        }
+
+        protected List<Map<String, String>> getFilterCacheContents() {
+            List<Map<String, String>> contents = new ArrayList<Map<String, String>>();
+
             ConcurrentMap<WeightedFilterCache.FilterCacheKey, DocSet> filterCacheMap =
                     indicesFilterCache.cache().asMap();
             for (Map.Entry<WeightedFilterCache.FilterCacheKey, DocSet> cacheEntry : filterCacheMap.entrySet()) {
                 WeightedFilterCache.FilterCacheKey cacheKey = cacheEntry.getKey();
-                Map<String, String> responseEntry = new HashMap<String, String>();
+                Map<String, String> entry = new HashMap<String, String>();
 
-                responseEntry.put("reader_key", cacheKey.readerKey().toString());
-                responseEntry.put("filter_key", cacheKey.filterKey().toString());
+                entry.put("reader_key", cacheKey.readerKey().toString());
+                entry.put("filter_key", cacheKey.filterKey().toString());
                 DocSet docSet = cacheEntry.getValue();
-                responseEntry.put("length", String.valueOf(docSet.length()));
-                responseEntry.put("size_in_bytes", String.valueOf(docSet.sizeInBytes()));
-                responseEntry.put("doc_set_class", docSet.getClass().getName());
+                if (docSet == DocSet.EMPTY_DOC_SET)
+                    entry.put("is_empty_doc_set", "true");
+                entry.put("length", String.valueOf(docSet.length()));
+                entry.put("size_in_bytes", String.valueOf(docSet.sizeInBytes()));
+                entry.put("doc_set_class", docSet.getClass().getName());
                 if (docSet instanceof FixedBitDocSet) {
                     FixedBitDocSet bitDocSet = (FixedBitDocSet) cacheEntry.getValue();
-                    responseEntry.put("cardinality", String.valueOf(bitDocSet.set().cardinality()));
+                    entry.put("cardinality", String.valueOf(bitDocSet.set().cardinality()));
                 }
 
-                response.addCacheEntry(responseEntry);
+                contents.add(entry);
             }
-            listener.onResponse(response);
+
+            return contents;
+        }
+
+        protected List<Map<String, String>> getFieldCacheContents() {
+            List<Map<String, String>> contents = new ArrayList<Map<String, String>>();
+
+            for (IndexService indexService : indicesService) {
+                FieldDataCache fieldDataCache = indexService.cache().fieldData();
+
+                if (!(fieldDataCache instanceof AbstractConcurrentMapFieldDataCache))
+                    return contents;
+
+                AbstractConcurrentMapFieldDataCache concurrentMapFieldDataCache =
+                        (AbstractConcurrentMapFieldDataCache) fieldDataCache;
+
+                ConcurrentMap<Object, Cache<String, FieldData>> cache;
+                try {
+                    Field f = AbstractConcurrentMapFieldDataCache.class.getDeclaredField("cache");
+                    f.setAccessible(true);
+                    cache = (ConcurrentMap<Object, Cache<String, FieldData>>) f.get(concurrentMapFieldDataCache);
+                } catch (Exception e) {
+                    logger.warn("Failed to get cache from AbstractConcurrentMapFieldDataCache", e);
+                    continue;
+                }
+
+                Map<String, String> entry = new HashMap<String, String>();
+
+                for (Map.Entry<Object, Cache<String, FieldData>> cacheEntry : cache.entrySet()) {
+                    entry.put("key", cacheEntry.getKey().toString());
+                    entry.put("value_size", String.valueOf(cacheEntry.getValue().size()));
+                }
+
+                contents.add(entry);
+            }
+
+            return contents;
         }
     }
 
@@ -177,15 +233,17 @@ public class GetCacheContents {
                         XContentBuilder builder = RestXContentBuilder.restContentBuilder(request);
                         builder.startObject();
 
-                        builder.field("cache_entries");
-                        builder.startArray();
-                        for (Map<String, String> cacheEntry : response.getCacheEntries()) {
-                            builder.startObject();
-                            for (Map.Entry<String, String> entry : cacheEntry.entrySet())
-                                builder.field(entry.getKey(), entry.getValue());
-                            builder.endObject();
+                        for (Map.Entry<String, List<Map<String, String>>> contentsEntry : response.getContentsMap().entrySet()) {
+                            builder.field(contentsEntry.getKey());
+                            builder.startArray();
+                            for (Map<String, String> entry : contentsEntry.getValue()) {
+                                builder.startObject();
+                                for (Map.Entry<String, String> kv : entry.entrySet())
+                                    builder.field(kv.getKey(), kv.getValue());
+                                builder.endObject();
+                            }
+                            builder.endArray();
                         }
-                        builder.endArray();
 
                         builder.endObject();
                         channel.sendResponse(new XContentRestResponse(request, OK, builder));
